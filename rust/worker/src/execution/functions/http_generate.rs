@@ -3,12 +3,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chroma_error::ChromaError;
-use chroma_segment::types::HydratedMaterializedLogRecord;
 use chroma_types::{AttachedFunction, Chunk, LogRecord, MaterializedLogOperation};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::execution::operators::execute_task::AttachedFunctionExecutor;
+use crate::execution::operators::execute_task::{AttachedFunctionExecutor, HydratedInputBatch};
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -54,11 +53,7 @@ struct StatusResponse {
 #[derive(Debug)]
 pub struct HttpGenerateExecutor {
     endpoint_url: String,
-    source_collection: String,
-    source_kind: String,
     output_collection: String,
-    tenant_id: String,
-    database_id: String,
     modal_key: String,
     modal_secret: String,
     client: reqwest::Client,
@@ -92,8 +87,7 @@ impl ChromaError for HttpGenerateError {
 impl HttpGenerateExecutor {
     /// Build from an `AttachedFunction`.
     ///
-    /// Reads `endpoint_url`, `source_collection`, and `source_kind` from
-    /// params JSON.  Modal proxy-auth tokens come from env vars
+    /// Reads `endpoint_url` from params JSON. Modal proxy-auth tokens come from env vars
     /// `MODAL_KEY` and `MODAL_SECRET`.
     pub fn from_attached_function(af: &AttachedFunction) -> Result<Self, Box<dyn ChromaError>> {
         let params_json = af.params.as_deref().unwrap_or("{}");
@@ -113,8 +107,6 @@ impl HttpGenerateExecutor {
         };
 
         let endpoint_url = get_str("endpoint_url")?;
-        let source_collection = get_str("source_collection")?;
-        let source_kind = get_str("source_kind")?;
 
         let modal_key = std::env::var("MODAL_KEY").map_err(|_| {
             Box::new(HttpGenerateError::MissingEnvVar("MODAL_KEY".into())) as Box<dyn ChromaError>
@@ -126,11 +118,7 @@ impl HttpGenerateExecutor {
 
         Ok(Self {
             endpoint_url,
-            source_collection,
-            source_kind,
             output_collection: af.output_collection_name.clone(),
-            tenant_id: af.tenant_id.clone(),
-            database_id: af.database_id.clone(),
             modal_key,
             modal_secret,
             client: reqwest::Client::builder()
@@ -287,13 +275,14 @@ fn metadata_value_to_json(value: &chroma_types::MetadataValue) -> serde_json::Va
 impl AttachedFunctionExecutor for HttpGenerateExecutor {
     async fn execute(
         &self,
-        input_records: Vec<Chunk<HydratedMaterializedLogRecord<'_, '_>>>,
+        input_batches: Vec<HydratedInputBatch<'_, '_>>,
         _output_reader: Option<&chroma_segment::blockfile_record::RecordSegmentReaderShard<'_>>,
     ) -> Result<Chunk<LogRecord>, Box<dyn ChromaError>> {
-        let mut records = Vec::new();
+        let mut any_records = false;
 
-        for input_batch in &input_records {
-            for (record, _) in input_batch.iter() {
+        for batch in &input_batches {
+            let mut records = Vec::new();
+            for (record, _) in batch.records.iter() {
                 if record.get_operation() == MaterializedLogOperation::DeleteExisting {
                     continue;
                 }
@@ -312,42 +301,44 @@ impl AttachedFunctionExecutor for HttpGenerateExecutor {
                     metadata,
                 });
             }
+
+            if records.is_empty() {
+                continue;
+            }
+
+            any_records = true;
+            let num_records = records.len();
+            let request_body = GenerateRequest {
+                record_set: GenerateRecordSet {
+                    tenant_id: batch.tenant_id.clone(),
+                    database_id: batch.database_id.clone(),
+                    source_collection: batch.input_collection_name.clone(),
+                    source_kind: batch.input_collection_name.clone(),
+                    output_collection: self.output_collection.clone(),
+                    base_collection: None,
+                    records,
+                    completion_offset: batch.completion_offset,
+                },
+            };
+
+            tracing::info!(
+                "[HttpGenerateExecutor] Spawning generation for {} records from input collection {} via {}",
+                num_records,
+                batch.input_collection_name,
+                self.endpoint_url,
+            );
+
+            let call_id = self.spawn_generation(&request_body).await?;
+            tracing::info!(
+                "[HttpGenerateExecutor] Job spawned with call_id={call_id}, polling for completion"
+            );
+
+            self.poll_until_done(&call_id).await?;
         }
 
-        if records.is_empty() {
+        if !any_records {
             tracing::info!("[HttpGenerateExecutor] No non-delete records to process");
-            return Ok(Chunk::new(Arc::from(Vec::<LogRecord>::new())));
         }
-
-        let num_records = records.len();
-        let request_body = GenerateRequest {
-            record_set: GenerateRecordSet {
-                tenant_id: self.tenant_id.clone(),
-                database_id: self.database_id.clone(),
-                source_collection: self.source_collection.clone(),
-                source_kind: self.source_kind.clone(),
-                output_collection: self.output_collection.clone(),
-                base_collection: None,
-                records,
-                // TODO: Remove completion offset from the schema of this request
-                completion_offset: 0,
-            },
-        };
-
-        tracing::info!(
-            "[HttpGenerateExecutor] Spawning generation for {} records via {}",
-            num_records,
-            self.endpoint_url,
-        );
-
-        // 1. POST /generate → get call_id
-        let call_id = self.spawn_generation(&request_body).await?;
-        tracing::info!(
-            "[HttpGenerateExecutor] Job spawned with call_id={call_id}, polling for completion"
-        );
-
-        // 2. Poll GET /status/{call_id} until done
-        self.poll_until_done(&call_id).await?;
 
         Ok(Chunk::new(Arc::from(Vec::<LogRecord>::new())))
     }

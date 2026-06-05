@@ -53,11 +53,10 @@
 //!
 //! NOTE(hammadb): I hate this design. It is all too clever.
 
-use crate::execution::operators::execute_task::AttachedFunctionExecutor;
+use crate::execution::operators::execute_task::{AttachedFunctionExecutor, HydratedInputBatch};
 use async_trait::async_trait;
 use chroma_error::ChromaError;
 use chroma_segment::blockfile_record::{RecordSegmentReaderOptions, RecordSegmentReaderShard};
-use chroma_segment::types::HydratedMaterializedLogRecord;
 use chroma_types::{
     AttachedFunction, Chunk, LogRecord, MaterializedLogOperation, MetadataValue, Operation,
     OperationRecord, UpdateMetadataValue,
@@ -333,10 +332,10 @@ impl RevisionHistoryExecutor {
 impl AttachedFunctionExecutor for RevisionHistoryExecutor {
     async fn execute(
         &self,
-        input_records: Vec<Chunk<HydratedMaterializedLogRecord<'_, '_>>>,
+        input_batches: Vec<HydratedInputBatch<'_, '_>>,
         output_reader: Option<&RecordSegmentReaderShard<'_>>,
     ) -> Result<Chunk<LogRecord>, Box<dyn ChromaError>> {
-        if input_records.is_empty() {
+        if input_batches.iter().all(|batch| batch.records.is_empty()) {
             return Ok(Chunk::new(Arc::from(Vec::new())));
         }
 
@@ -348,105 +347,103 @@ impl AttachedFunctionExecutor for RevisionHistoryExecutor {
         let mut trackers: HashMap<String, RevisionTracker> = HashMap::new();
         let mut output = Vec::new();
 
-        for batch in input_records {
-            for (record, _index) in batch.iter() {
-                let original_id = record.get_user_id().to_string();
+        for (record, _index) in input_batches.iter().flat_map(|batch| batch.records.iter()) {
+            let original_id = record.get_user_id().to_string();
 
-                if !trackers.contains_key(&original_id) {
-                    let state = RevisionTracker::from_reader(output_reader, &original_id).await;
-                    trackers.insert(original_id.clone(), state);
-                }
+            if !trackers.contains_key(&original_id) {
+                let state = RevisionTracker::from_reader(output_reader, &original_id).await;
+                trackers.insert(original_id.clone(), state);
+            }
 
-                // SAFETY(hammadb): We know the tracker exists because we just inserted it above.
-                let tracker = trackers.get_mut(&original_id).unwrap();
+            // SAFETY(hammadb): We know the tracker exists because we just inserted it above.
+            let tracker = trackers.get_mut(&original_id).unwrap();
 
-                if record.get_operation() == MaterializedLogOperation::DeleteExisting {
-                    // Read the source_version from the record being deleted so all chunks
-                    // of the same document get the same tombstone position (virtual_sv = sv + 1).
-                    let merged_metadata = record.merged_metadata();
-                    let source_version = match merged_metadata.get(&self.version_key) {
-                        Some(MetadataValue::Int(v)) => Some(*v),
-                        _ => None,
-                    };
+            if record.get_operation() == MaterializedLogOperation::DeleteExisting {
+                // Read the source_version from the record being deleted so all chunks
+                // of the same document get the same tombstone position (virtual_sv = sv + 1).
+                let merged_metadata = record.merged_metadata();
+                let source_version = match merged_metadata.get(&self.version_key) {
+                    Some(MetadataValue::Int(v)) => Some(*v),
+                    _ => None,
+                };
 
-                    let effective_version = if let Some(sv) = source_version {
-                        let virtual_sv = sv + 1;
-                        match tracker.next_version_for_source(virtual_sv) {
-                            Some(v) => v,
-                            None => continue,
-                        }
-                    } else {
-                        tracker.next_version_fallback()
-                    };
-
-                    let composite_id = revision_id(&original_id, effective_version);
-
-                    let rev_meta = RevisionMetadata {
-                        original_id: original_id.clone(),
-                        version: effective_version,
-                        source_version,
-                        archived_at: now,
-                        is_delete: true,
-                    };
-
-                    output.push(LogRecord {
-                        log_offset: 0,
-                        record: OperationRecord {
-                            id: composite_id,
-                            embedding: Some(PLACEHOLDER_EMBEDDING.to_vec()),
-                            encoding: None,
-                            metadata: Some(rev_meta.into_update_metadata(None)),
-                            document: None,
-                            operation: Operation::Upsert,
-                        },
-                    });
+                let effective_version = if let Some(sv) = source_version {
+                    let virtual_sv = sv + 1;
+                    match tracker.next_version_for_source(virtual_sv) {
+                        Some(v) => v,
+                        None => continue,
+                    }
                 } else {
-                    let merged_metadata = record.merged_metadata();
-                    let source_version = match merged_metadata.get(&self.version_key) {
-                        Some(MetadataValue::Int(v)) => Some(*v),
-                        _ => {
-                            tracing::warn!(
-                                record_id = %original_id,
-                                version_key = %self.version_key,
-                                "version_key not found in record metadata; archiving without source_version"
-                            );
-                            None
-                        }
-                    };
+                    tracker.next_version_fallback()
+                };
 
-                    let effective_version = if let Some(sv) = source_version {
-                        match tracker.next_version_for_source(sv) {
-                            Some(v) => v,
-                            None => continue, // already archived
-                        }
-                    } else {
-                        tracker.next_version_fallback()
-                    };
+                let composite_id = revision_id(&original_id, effective_version);
 
-                    let composite_id = revision_id(&original_id, effective_version);
+                let rev_meta = RevisionMetadata {
+                    original_id: original_id.clone(),
+                    version: effective_version,
+                    source_version,
+                    archived_at: now,
+                    is_delete: true,
+                };
 
-                    let rev_meta = RevisionMetadata {
-                        original_id: original_id.clone(),
-                        version: effective_version,
-                        source_version,
-                        archived_at: now,
-                        is_delete: false,
-                    };
+                output.push(LogRecord {
+                    log_offset: 0,
+                    record: OperationRecord {
+                        id: composite_id,
+                        embedding: Some(PLACEHOLDER_EMBEDDING.to_vec()),
+                        encoding: None,
+                        metadata: Some(rev_meta.into_update_metadata(None)),
+                        document: None,
+                        operation: Operation::Upsert,
+                    },
+                });
+            } else {
+                let merged_metadata = record.merged_metadata();
+                let source_version = match merged_metadata.get(&self.version_key) {
+                    Some(MetadataValue::Int(v)) => Some(*v),
+                    _ => {
+                        tracing::warn!(
+                            record_id = %original_id,
+                            version_key = %self.version_key,
+                            "version_key not found in record metadata; archiving without source_version"
+                        );
+                        None
+                    }
+                };
 
-                    let document = record.merged_document_ref().map(|s| s.to_string());
+                let effective_version = if let Some(sv) = source_version {
+                    match tracker.next_version_for_source(sv) {
+                        Some(v) => v,
+                        None => continue, // already archived
+                    }
+                } else {
+                    tracker.next_version_fallback()
+                };
 
-                    output.push(LogRecord {
-                        log_offset: 0,
-                        record: OperationRecord {
-                            id: composite_id,
-                            embedding: Some(PLACEHOLDER_EMBEDDING.to_vec()),
-                            encoding: None,
-                            metadata: Some(rev_meta.into_update_metadata(Some(&merged_metadata))),
-                            document,
-                            operation: Operation::Upsert,
-                        },
-                    });
-                }
+                let composite_id = revision_id(&original_id, effective_version);
+
+                let rev_meta = RevisionMetadata {
+                    original_id: original_id.clone(),
+                    version: effective_version,
+                    source_version,
+                    archived_at: now,
+                    is_delete: false,
+                };
+
+                let document = record.merged_document_ref().map(|s| s.to_string());
+
+                output.push(LogRecord {
+                    log_offset: 0,
+                    record: OperationRecord {
+                        id: composite_id,
+                        embedding: Some(PLACEHOLDER_EMBEDDING.to_vec()),
+                        encoding: None,
+                        metadata: Some(rev_meta.into_update_metadata(Some(&merged_metadata))),
+                        document,
+                        operation: Operation::Upsert,
+                    },
+                });
             }
         }
 
@@ -651,7 +648,7 @@ mod tests {
         let input = Chunk::new(Arc::from(hydrated));
 
         let output = executor
-            .execute(vec![input], None)
+            .execute(input, None)
             .await
             .expect("execution succeeds");
 
@@ -716,7 +713,7 @@ mod tests {
         let input = Chunk::new(Arc::from(hydrated));
 
         let output = executor
-            .execute(vec![input], None)
+            .execute(input, None)
             .await
             .expect("execution succeeds");
 
@@ -795,7 +792,7 @@ mod tests {
         let input = Chunk::new(Arc::from(hydrated));
 
         let output = executor
-            .execute(vec![input], Some(&output_record_reader))
+            .execute(input, Some(&output_record_reader))
             .await
             .expect("execution succeeds");
 
@@ -859,7 +856,7 @@ mod tests {
         let input = Chunk::new(Arc::from(hydrated));
 
         let output = executor
-            .execute(vec![input], Some(&output_record_reader))
+            .execute(input, Some(&output_record_reader))
             .await
             .expect("execution succeeds");
 
@@ -911,7 +908,7 @@ mod tests {
         let input = Chunk::new(Arc::from(hydrated));
 
         let output = executor
-            .execute(vec![input], None)
+            .execute(input, None)
             .await
             .expect("execution succeeds");
 
@@ -944,7 +941,7 @@ mod tests {
         let input = Chunk::new(Arc::from(hydrated));
 
         let output = executor
-            .execute(vec![input], None)
+            .execute(input, None)
             .await
             .expect("execution succeeds");
         assert_eq!(output.len(), 0);
@@ -1022,7 +1019,7 @@ mod tests {
         let input = Chunk::new(Arc::from(hydrated));
 
         let output = executor
-            .execute(vec![input], Some(&output_record_reader))
+            .execute(input, Some(&output_record_reader))
             .await
             .expect("execution succeeds");
 
@@ -1093,7 +1090,7 @@ mod tests {
         let input = Chunk::new(Arc::from(hydrated));
 
         let output = executor
-            .execute(vec![input], None)
+            .execute(input, None)
             .await
             .expect("execution succeeds");
 
@@ -1267,7 +1264,7 @@ mod tests {
         let input = Chunk::new(Arc::from(hydrated));
 
         let output = executor
-            .execute(vec![input], Some(&output_record_reader))
+            .execute(input, Some(&output_record_reader))
             .await
             .expect("execution succeeds");
 
@@ -1322,7 +1319,7 @@ mod tests {
         let input = Chunk::new(Arc::from(hydrated));
 
         let output = executor
-            .execute(vec![input], Some(&output_record_reader))
+            .execute(input, Some(&output_record_reader))
             .await
             .expect("execution succeeds");
 
