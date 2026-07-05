@@ -82,6 +82,7 @@ from typing import (
 from overrides import override
 from uuid import UUID, uuid4
 from functools import wraps
+import threading
 import time
 import logging
 import re
@@ -147,6 +148,7 @@ class SegmentAPI(ServerAPI):
         self._opentelemetry_client = self.require(OpenTelemetryClient)
         self._producer = self.require(Producer)
         self._rate_limit_enforcer = self._system.require(RateLimitEnforcer)
+        self._collection_lock: threading.RLock = threading.RLock()
 
     @override
     def heartbeat(self) -> int:
@@ -229,68 +231,69 @@ class SegmentAPI(ServerAPI):
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> CollectionModel:
-        if metadata is not None:
-            validate_metadata(metadata)
+        with self._collection_lock:
+            if metadata is not None:
+                validate_metadata(metadata)
 
-        # TODO: remove backwards compatibility in naming requirements
-        check_index_name(name)
+            # TODO: remove backwards compatibility in naming requirements
+            check_index_name(name)
 
-        self._quota_enforcer.enforce(
-            action=Action.CREATE_COLLECTION,
-            tenant=tenant,
-            name=name,
-            metadata=metadata,
-        )
-
-        id = uuid4()
-
-        model = CollectionModel(
-            id=id,
-            name=name,
-            metadata=metadata,
-            serialized_schema=None,
-            configuration_json=create_collection_configuration_to_json(
-                configuration or CreateCollectionConfiguration(), metadata
-            ),
-            tenant=tenant,
-            database=database,
-            dimension=None,
-        )
-
-        # TODO: Let sysdb create the collection directly from the model
-        coll, created = self._sysdb.create_collection(
-            id=model.id,
-            name=model.name,
-            schema=schema,
-            configuration=configuration or CreateCollectionConfiguration(),
-            segments=[],  # Passing empty till backend changes are deployed.
-            metadata=model.metadata,
-            dimension=None,  # This is lazily populated on the first add
-            get_or_create=get_or_create,
-            tenant=tenant,
-            database=database,
-        )
-
-        if created:
-            segments = self._manager.prepare_segments_for_new_collection(coll)
-            for segment in segments:
-                self._sysdb.create_segment(segment)
-        else:
-            logger.debug(
-                f"Collection {name} already exists, returning existing collection."
+            self._quota_enforcer.enforce(
+                action=Action.CREATE_COLLECTION,
+                tenant=tenant,
+                name=name,
+                metadata=metadata,
             )
 
-        # TODO: This event doesn't capture the get_or_create case appropriately
-        # TODO: Re-enable embedding function tracking in create_collection
-        self._product_telemetry_client.capture(
-            ClientCreateCollectionEvent(
-                collection_uuid=str(id),
-                # embedding_function=embedding_function.__class__.__name__,
-            )
-        )
-        add_attributes_to_current_span({"collection_uuid": str(id)})
+            id = uuid4()
 
-        return coll
+            model = CollectionModel(
+                id=id,
+                name=name,
+                metadata=metadata,
+                serialized_schema=None,
+                configuration_json=create_collection_configuration_to_json(
+                    configuration or CreateCollectionConfiguration(), metadata
+                ),
+                tenant=tenant,
+                database=database,
+                dimension=None,
+            )
+
+            # TODO: Let sysdb create the collection directly from the model
+            coll, created = self._sysdb.create_collection(
+                id=model.id,
+                name=model.name,
+                schema=schema,
+                configuration=configuration or CreateCollectionConfiguration(),
+                segments=[],  # Passing empty till backend changes are deployed.
+                metadata=model.metadata,
+                dimension=None,  # This is lazily populated on the first add
+                get_or_create=get_or_create,
+                tenant=tenant,
+                database=database,
+            )
+
+            if created:
+                segments = self._manager.prepare_segments_for_new_collection(coll)
+                for segment in segments:
+                    self._sysdb.create_segment(segment)
+            else:
+                logger.debug(
+                    f"Collection {name} already exists, returning existing collection."
+                )
+
+            # TODO: This event doesn't capture the get_or_create case appropriately
+            # TODO: Re-enable embedding function tracking in create_collection
+            self._product_telemetry_client.capture(
+                ClientCreateCollectionEvent(
+                    collection_uuid=str(id),
+                    # embedding_function=embedding_function.__class__.__name__,
+                )
+            )
+            add_attributes_to_current_span({"collection_uuid": str(id)})
+
+            return coll
 
     @trace_method(
         "SegmentAPI.get_or_create_collection", OpenTelemetryGranularity.OPERATION
@@ -490,17 +493,18 @@ class SegmentAPI(ServerAPI):
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> None:
-        existing = self._sysdb.get_collections(
-            name=name, tenant=tenant, database=database
-        )
-
-        if existing:
-            self._manager.delete_segments(existing[0].id)
-            self._sysdb.delete_collection(
-                existing[0].id, tenant=tenant, database=database
+        with self._collection_lock:
+            existing = self._sysdb.get_collections(
+                name=name, tenant=tenant, database=database
             )
-        else:
-            raise ValueError(f"Collection {name} does not exist.")
+
+            if existing:
+                self._manager.delete_segments(existing[0].id)
+                self._sysdb.delete_collection(
+                    existing[0].id, tenant=tenant, database=database
+                )
+            else:
+                raise ValueError(f"Collection {name} does not exist.")
 
     @trace_method("SegmentAPI._add", OpenTelemetryGranularity.OPERATION)
     @override
